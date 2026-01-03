@@ -103,52 +103,116 @@ app.get('/screenshot', async (req, res) => {
     await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
     await scrollAndLoad(page);
 
-    // Inject Readability and apply reader mode directly on the page
+    // Inject Readability.js from CDN
+    await page.addScriptTag({
+      url: 'https://cdn.jsdelivr.net/npm/@mozilla/readability@0.5.0/Readability.min.js'
+    });
+
+    await page.waitForTimeout(500);
+
+    // Apply reader mode using actual Readability
     const readerModeApplied = await page.evaluate(() => {
       try {
-        // Clone the document to avoid modifying the original
-        const documentClone = document.cloneNode(true);
-
-        // Use Readability to parse (we need to inject it first)
-        // For now, let's use a simpler approach: find the main content area
-
-        // Common article selectors
-        const articleSelectors = [
-          'article',
-          '[role="main"]',
-          'main',
-          '.article-content',
-          '.post-content',
-          '.entry-content',
-          '#content',
-          '.content'
+        // First, remove all popups, modals, overlays, cookie banners
+        const popupSelectors = [
+          '[class*="modal"]', '[id*="modal"]',
+          '[class*="popup"]', '[id*="popup"]',
+          '[class*="overlay"]', '[id*="overlay"]',
+          '[class*="cookie"]', '[id*="cookie"]',
+          '[class*="consent"]', '[id*="consent"]',
+          '[class*="banner"]', '[id*="banner"]',
+          '[class*="dialog"]', '[id*="dialog"]',
+          '[role="dialog"]', '[role="alertdialog"]',
+          '.fancybox-overlay', '.fancybox-wrap',
+          '#onetrust-consent-sdk',
+          '[class*="lightbox"]',
+          '[class*="subscribe"]',
+          '[class*="newsletter"]'
         ];
 
-        let articleElement = null;
-        for (const selector of articleSelectors) {
-          articleElement = document.querySelector(selector);
-          if (articleElement) break;
+        popupSelectors.forEach(selector => {
+          try {
+            document.querySelectorAll(selector).forEach(el => {
+              el.remove();
+            });
+          } catch (e) {}
+        });
+
+        // Remove fixed/sticky elements that might overlay content
+        document.querySelectorAll('*').forEach(el => {
+          const style = window.getComputedStyle(el);
+          if (style.position === 'fixed' || style.position === 'sticky') {
+            const zIndex = parseInt(style.zIndex) || 0;
+            // Only remove high z-index elements (likely popups/modals)
+            if (zIndex > 1000) {
+              el.remove();
+            }
+          }
+        });
+
+        // Clone the document for Readability
+        const documentClone = document.cloneNode(true);
+
+        // Check if Readability is available
+        if (typeof Readability === 'undefined') {
+          console.error('Readability not loaded');
+          return false;
         }
 
+        // Parse with Readability
+        const reader = new Readability(documentClone);
+        const article = reader.parse();
+
+        if (!article) {
+          console.error('Readability could not parse article');
+          return false;
+        }
+
+        // Find the original article element in the actual DOM
+        // We'll use the title to help identify it
+        let articleElement = null;
+
+        // Try to find by article tag first
+        const articles = document.querySelectorAll('article, [role="main"], main');
+        for (const el of articles) {
+          if (el.innerText && el.innerText.length > 500) {
+            articleElement = el;
+            break;
+          }
+        }
+
+        // If not found, find the element with the most matching text
         if (!articleElement) {
-          // If no article found, try to find the element with most text content
           const allElements = document.querySelectorAll('div, section, article');
-          let maxTextLength = 0;
+          let bestMatch = null;
+          let maxScore = 0;
 
           allElements.forEach(el => {
-            const textLength = el.innerText?.length || 0;
-            if (textLength > maxTextLength) {
-              maxTextLength = textLength;
-              articleElement = el;
+            const text = el.innerText || '';
+            const textLength = text.length;
+
+            // Calculate score based on text length and presence of paragraphs
+            const paragraphs = el.querySelectorAll('p').length;
+            const score = textLength + (paragraphs * 100);
+
+            if (score > maxScore && textLength > 500) {
+              maxScore = score;
+              bestMatch = el;
             }
           });
+
+          articleElement = bestMatch;
         }
 
         if (!articleElement) {
           return false;
         }
 
-        // Hide everything in body
+        // Get all images in the article
+        const articleImages = Array.from(articleElement.querySelectorAll('img'));
+        const articleImageSrcs = articleImages.map(img => img.src);
+
+        // Style the body
         document.body.style.cssText = `
           margin: 0 !important;
           padding: 40px 20px !important;
@@ -158,14 +222,12 @@ app.get('/screenshot', async (req, res) => {
           color: #333 !important;
         `;
 
-        // Hide all direct children of body
+        // Remove ALL body children
         Array.from(document.body.children).forEach(child => {
-          if (!child.contains(articleElement)) {
-            child.style.display = 'none';
-          }
+          child.remove();
         });
 
-        // Create a wrapper for the article
+        // Create a clean wrapper
         const wrapper = document.createElement('div');
         wrapper.style.cssText = `
           max-width: 800px !important;
@@ -173,48 +235,60 @@ app.get('/screenshot', async (req, res) => {
           padding: 0 !important;
         `;
 
-        // Move article into wrapper
-        const articleParent = articleElement.parentNode;
-        articleParent.insertBefore(wrapper, articleElement);
-        wrapper.appendChild(articleElement);
+        // Add title
+        const titleEl = document.createElement('h1');
+        titleEl.textContent = article.title;
+        titleEl.style.cssText = 'font-size: 2em; margin-bottom: 0.5em;';
+        wrapper.appendChild(titleEl);
 
-        // Clean up article styling
+        // Add byline if exists
+        if (article.byline) {
+          const bylineEl = document.createElement('div');
+          bylineEl.textContent = article.byline;
+          bylineEl.style.cssText = 'color: #666; font-style: italic; margin-bottom: 1em;';
+          wrapper.appendChild(bylineEl);
+        }
+
+        // Add article element back
+        wrapper.appendChild(articleElement);
+        document.body.appendChild(wrapper);
+
+        // Clean article styling
         articleElement.style.cssText = `
           background: transparent !important;
           max-width: 100% !important;
         `;
 
-        // Style images
-        const images = articleElement.querySelectorAll('img');
-        images.forEach(img => {
-          img.style.cssText = `
-            max-width: 100% !important;
-            height: auto !important;
-            display: block !important;
-            margin: 1em 0 !important;
-          `;
+        // Remove all images that are NOT in the article
+        document.querySelectorAll('img').forEach(img => {
+          if (!articleImageSrcs.includes(img.src)) {
+            img.remove();
+          } else {
+            // Style article images
+            img.style.cssText = `
+              max-width: 100% !important;
+              height: auto !important;
+              display: block !important;
+              margin: 1em auto !important;
+            `;
+          }
         });
 
         // Style paragraphs
-        const paragraphs = articleElement.querySelectorAll('p');
-        paragraphs.forEach(p => {
+        articleElement.querySelectorAll('p').forEach(p => {
           p.style.margin = '1em 0';
         });
 
-        // Hide navigation, headers, footers, sidebars, ads
+        // Remove navigation, ads, etc. that might still be in the article
         const hideSelectors = [
           'nav', 'header', 'footer', 'aside',
           '[role="navigation"]', '[role="banner"]', '[role="complementary"]',
           '.nav', '.navigation', '.menu', '.sidebar', '.ads', '.advertisement',
-          '.social-share', '.comments', '.related-posts'
+          '.social-share', '.comments', '.related-posts', '.newsletter'
         ];
 
         hideSelectors.forEach(selector => {
-          document.querySelectorAll(selector).forEach(el => {
-            if (!articleElement.contains(el) || el.contains(articleElement)) {
-              el.style.display = 'none';
-            }
-          });
+          articleElement.querySelectorAll(selector).forEach(el => el.remove());
         });
 
         return true;
@@ -269,65 +343,131 @@ app.get('/screenshot/images', async (req, res) => {
     await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
     await scrollAndLoad(page);
 
-    // Find article images on the actual page (don't rebuild)
-    const articleImageSelectors = await page.evaluate(() => {
-      // Common article selectors
-      const articleSelectors = [
-        'article',
-        '[role="main"]',
-        'main',
-        '.article-content',
-        '.post-content',
-        '.entry-content',
-        '#content',
-        '.content'
-      ];
-
-      let articleElement = null;
-      for (const selector of articleSelectors) {
-        articleElement = document.querySelector(selector);
-        if (articleElement) break;
-      }
-
-      if (!articleElement) {
-        // If no article found, try to find the element with most text content
-        const allElements = document.querySelectorAll('div, section, article');
-        let maxTextLength = 0;
-
-        allElements.forEach(el => {
-          const textLength = el.innerText?.length || 0;
-          if (textLength > maxTextLength) {
-            maxTextLength = textLength;
-            articleElement = el;
-          }
-        });
-      }
-
-      // Get images from article only
-      if (articleElement) {
-        const images = Array.from(articleElement.querySelectorAll('img'));
-        return images.map(img => ({
-          src: img.src,
-          alt: img.alt || '',
-          width: img.naturalWidth || img.width,
-          height: img.naturalHeight || img.height
-        }));
-      }
-
-      return [];
+    // Inject Readability.js from CDN
+    await page.addScriptTag({
+      url: 'https://cdn.jsdelivr.net/npm/@mozilla/readability@0.5.0/Readability.min.js'
     });
 
-    // Screenshot each image element
-    const imageElements = await page.$$('article img, [role="main"] img, main img, .article-content img, .post-content img, .entry-content img');
+    await page.waitForTimeout(500);
+
+    // Get article images using Readability
+    const articleImageInfo = await page.evaluate(() => {
+      try {
+        // Remove popups first
+        const popupSelectors = [
+          '[class*="modal"]', '[id*="modal"]',
+          '[class*="popup"]', '[id*="popup"]',
+          '[class*="overlay"]', '[id*="overlay"]',
+          '[class*="cookie"]', '[id*="cookie"]',
+          '[class*="consent"]', '[id*="consent"]',
+          '[role="dialog"]', '[role="alertdialog"]'
+        ];
+
+        popupSelectors.forEach(selector => {
+          try {
+            document.querySelectorAll(selector).forEach(el => el.remove());
+          } catch (e) {}
+        });
+
+        // Clone and parse with Readability
+        const documentClone = document.cloneNode(true);
+
+        if (typeof Readability === 'undefined') {
+          return { success: false, images: [] };
+        }
+
+        const reader = new Readability(documentClone);
+        const article = reader.parse();
+
+        if (!article) {
+          return { success: false, images: [] };
+        }
+
+        // Find the article element in the actual DOM
+        let articleElement = null;
+        const articles = document.querySelectorAll('article, [role="main"], main');
+
+        for (const el of articles) {
+          if (el.innerText && el.innerText.length > 500) {
+            articleElement = el;
+            break;
+          }
+        }
+
+        if (!articleElement) {
+          const allElements = document.querySelectorAll('div, section, article');
+          let bestMatch = null;
+          let maxScore = 0;
+
+          allElements.forEach(el => {
+            const text = el.innerText || '';
+            const textLength = text.length;
+            const paragraphs = el.querySelectorAll('p').length;
+            const score = textLength + (paragraphs * 100);
+
+            if (score > maxScore && textLength > 500) {
+              maxScore = score;
+              bestMatch = el;
+            }
+          });
+
+          articleElement = bestMatch;
+        }
+
+        if (!articleElement) {
+          return { success: false, images: [] };
+        }
+
+        // Get all images in the article
+        const images = Array.from(articleElement.querySelectorAll('img'));
+
+        // Filter out small images (likely icons, logos, etc.)
+        const contentImages = images.filter(img => {
+          const width = img.naturalWidth || img.width || 0;
+          const height = img.naturalHeight || img.height || 0;
+          // Only include images that are at least 200x100 pixels
+          return width >= 200 && height >= 100;
+        });
+
+        return {
+          success: true,
+          images: contentImages.map((img, idx) => ({
+            index: idx,
+            src: img.src,
+            alt: img.alt || '',
+            width: img.naturalWidth || img.width,
+            height: img.naturalHeight || img.height
+          }))
+        };
+
+      } catch (e) {
+        console.error('Image extraction error:', e);
+        return { success: false, images: [] };
+      }
+    });
+
+    if (!articleImageInfo.success || articleImageInfo.images.length === 0) {
+      await page.close();
+      return res.status(404).json({ error: 'No images found in the article content' });
+    }
+
+    // Now screenshot each image by index
     const imageBuffers = [];
 
-    for (let i = 0; i < imageElements.length; i++) {
+    for (let i = 0; i < articleImageInfo.images.length; i++) {
       try {
-        const screenshotBuffer = await imageElements[i].screenshot();
-        imageBuffers.push({
-          buffer: screenshotBuffer,
-          info: articleImageSelectors[i] || {}
-        });
+        const imgInfo = articleImageInfo.images[i];
+
+        // Find the image element by src
+        const imageElement = await page.$(`img[src="${imgInfo.src}"]`);
+
+        if (imageElement) {
+          const screenshotBuffer = await imageElement.screenshot();
+          imageBuffers.push({
+            buffer: screenshotBuffer,
+            info: imgInfo
+          });
+        }
       } catch (err) {
         console.error(`Failed to screenshot image ${i}:`, err.message);
       }
@@ -336,7 +476,7 @@ app.get('/screenshot/images', async (req, res) => {
     await page.close();
 
     if (imageBuffers.length === 0) {
-      return res.status(404).json({ error: 'No images found in the article content' });
+      return res.status(404).json({ error: 'Failed to capture image screenshots' });
     }
 
     // Return all images as array of base64 encoded binaries
@@ -346,7 +486,9 @@ app.get('/screenshot/images', async (req, res) => {
       mimeType: 'image/png',
       data: item.buffer.toString('base64'),
       src: item.info.src || '',
-      alt: item.info.alt || ''
+      alt: item.info.alt || '',
+      width: item.info.width || 0,
+      height: item.info.height || 0
     }));
 
     res.setHeader('Content-Type', 'application/json');
