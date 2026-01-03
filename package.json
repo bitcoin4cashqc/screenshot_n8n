@@ -1,0 +1,13 @@
+{
+  "name": "operix-screenshot",
+  "version": "1.0.0",
+  "description": "Screenshot service with Puppeteer",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "puppeteer": "^21.6.1"
+  }
+}
