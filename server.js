@@ -37,16 +37,13 @@ async function initBrowser() {
 
 // Helper function to configure a new page
 async function configurePage(page) {
-  // Set realistic user agent
   await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
 
-  // Set extra headers
   await page.setExtraHTTPHeaders({
     'Accept-Language': 'en-US,en;q=0.9',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
   });
 
-  // Override navigator properties to hide automation
   await page.evaluateOnNewDocument(() => {
     Object.defineProperty(navigator, 'webdriver', { get: () => false });
     Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
@@ -59,10 +56,8 @@ async function configurePage(page) {
 
 // Helper function to scroll and load content
 async function scrollAndLoad(page) {
-  // Additional wait for dynamic content
   await page.waitForTimeout(3000);
 
-  // Scroll to bottom to trigger lazy loading
   await page.evaluate(async () => {
     await new Promise((resolve) => {
       let totalHeight = 0;
@@ -79,10 +74,7 @@ async function scrollAndLoad(page) {
     });
   });
 
-  // Wait a bit more after scrolling
   await page.waitForTimeout(2000);
-
-  // Scroll back to top
   await page.evaluate(() => window.scrollTo(0, 0));
   await page.waitForTimeout(500);
 }
@@ -99,234 +91,67 @@ app.get('/screenshot', async (req, res) => {
     page = await browser.newPage();
     await configurePage(page);
 
-    // Load the original page
     await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
     await scrollAndLoad(page);
 
-    // Apply reader mode using inline article detection
-    const readerModeApplied = await page.evaluate(() => {
-      try {
-        // First, remove all popups, modals, overlays, cookie banners
-        const popupSelectors = [
-          '[class*="modal"]', '[id*="modal"]',
-          '[class*="popup"]', '[id*="popup"]',
-          '[class*="overlay"]', '[id*="overlay"]',
-          '[class*="cookie"]', '[id*="cookie"]',
-          '[class*="consent"]', '[id*="consent"]',
-          '[class*="banner"]', '[id*="banner"]',
-          '[class*="dialog"]', '[id*="dialog"]',
-          '[role="dialog"]', '[role="alertdialog"]',
-          '.fancybox-overlay', '.fancybox-wrap',
-          '#onetrust-consent-sdk',
-          '[class*="lightbox"]',
-          '[class*="subscribe"]',
-          '[class*="newsletter"]'
-        ];
+    // Try loading Readability from CDN
+    try {
+      await page.addScriptTag({ url: 'https://unpkg.com/@mozilla/readability@0.5.0/Readability.js' });
+    } catch (e) {
+      console.warn('CDN failed, using fallback');
+    }
 
-        popupSelectors.forEach(selector => {
-          try {
-            document.querySelectorAll(selector).forEach(el => {
-              el.remove();
-            });
-          } catch (e) {}
-        });
+    await page.waitForTimeout(500);
 
-        // Remove fixed/sticky elements that might overlay content
+    // Apply Readability
+    await page.evaluate(() => {
+      if (typeof Readability !== 'undefined') {
+        // Remove popups/modals
+        document.querySelectorAll('[class*="modal"], [class*="popup"], [class*="overlay"], [class*="cookie"], [role="dialog"]').forEach(el => el.remove());
         document.querySelectorAll('*').forEach(el => {
           const style = window.getComputedStyle(el);
-          if (style.position === 'fixed' || style.position === 'sticky') {
-            const zIndex = parseInt(style.zIndex) || 0;
-            // Only remove high z-index elements (likely popups/modals)
-            if (zIndex > 1000) {
-              el.remove();
-            }
+          if ((style.position === 'fixed' || style.position === 'sticky') && parseInt(style.zIndex || 0) > 1000) {
+            el.remove();
           }
         });
 
-        // Smart article detection algorithm
-        function scoreElement(el) {
-          let score = 0;
-          const tagName = el.tagName.toLowerCase();
-          const className = el.className || '';
-          const id = el.id || '';
+        // Parse with Readability
+        const documentClone = document.cloneNode(true);
+        const reader = new Readability(documentClone);
+        const article = reader.parse();
 
-          // Positive signals for article content
-          if (tagName === 'article') score += 100;
-          if (tagName === 'main') score += 80;
-          if (/article|content|post|entry|main|text|body/.test(className + id)) score += 50;
+        if (article) {
+          // Replace entire body with clean article HTML
+          document.body.innerHTML = `
+            <div style="max-width: 800px; margin: 0 auto; padding: 40px 20px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; background: #fff; color: #333;">
+              <h1 style="font-size: 2em; margin-bottom: 0.5em;">${article.title}</h1>
+              ${article.byline ? `<div style="color: #666; font-style: italic; margin-bottom: 1em;">${article.byline}</div>` : ''}
+              <div style="font-size: 1.1em;">
+                ${article.content}
+              </div>
+            </div>
+          `;
 
-          // Count paragraphs (good signal)
-          const paragraphs = el.getElementsByTagName('p').length;
-          score += paragraphs * 10;
-
-          // Text length (very important)
-          const text = el.innerText || '';
-          score += Math.min(text.length / 10, 500);
-
-          // Images are good for articles
-          const images = el.getElementsByTagName('img');
-          const contentImages = Array.from(images).filter(img => {
-            const w = img.naturalWidth || img.width || 0;
-            const h = img.naturalHeight || img.height || 0;
-            return w >= 200 && h >= 100;
+          // Style images
+          document.querySelectorAll('img').forEach(img => {
+            img.style.cssText = 'max-width: 100% !important; height: auto !important; display: block !important; margin: 1em auto !important;';
           });
-          score += contentImages.length * 20;
 
-          // Negative signals
-          if (/comment|widget|sidebar|footer|header|nav|menu|ad|banner/.test(className + id)) score -= 100;
-          if (tagName === 'nav' || tagName === 'aside' || tagName === 'header' || tagName === 'footer') score -= 50;
-
-          // Links vs text ratio (too many links = not article)
-          const links = el.getElementsByTagName('a').length;
-          if (paragraphs > 0 && links / paragraphs > 2) score -= 50;
-
-          return score;
+          document.querySelectorAll('p').forEach(p => {
+            p.style.margin = '1em 0';
+          });
         }
-
-        // Find the best article element
-        const candidates = document.querySelectorAll('article, main, div, section, [role="main"]');
-        let articleElement = null;
-        let bestScore = 0;
-
-        candidates.forEach(el => {
-          const score = scoreElement(el);
-          if (score > bestScore && score > 100) {
-            bestScore = score;
-            articleElement = el;
-          }
-        });
-
-        if (!articleElement) {
-          console.error('Could not find article element');
-          return false;
-        }
-
-        // Get title from the page
-        let title = document.querySelector('h1')?.innerText ||
-                   document.querySelector('[property="og:title"]')?.content ||
-                   document.querySelector('title')?.innerText ||
-                   'Article';
-
-        // Get byline/author
-        let byline = document.querySelector('[rel="author"]')?.innerText ||
-                    document.querySelector('[class*="author"]')?.innerText ||
-                    document.querySelector('[property="article:author"]')?.content ||
-                    '';
-
-        // Get all images in the article BEFORE we modify DOM
-        const articleImages = Array.from(articleElement.querySelectorAll('img'));
-        const articleImageSrcs = articleImages
-          .filter(img => {
-            const w = img.naturalWidth || img.width || 0;
-            const h = img.naturalHeight || img.height || 0;
-            return w >= 200 && h >= 100; // Filter out small images
-          })
-          .map(img => img.src);
-
-        // Style the body
-        document.body.style.cssText = `
-          margin: 0 !important;
-          padding: 40px 20px !important;
-          background: #fff !important;
-          font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif !important;
-          line-height: 1.6 !important;
-          color: #333 !important;
-        `;
-
-        // Remove ALL body children
-        Array.from(document.body.children).forEach(child => {
-          child.remove();
-        });
-
-        // Create a clean wrapper
-        const wrapper = document.createElement('div');
-        wrapper.style.cssText = `
-          max-width: 800px !important;
-          margin: 0 auto !important;
-          padding: 0 !important;
-        `;
-
-        // Add title
-        const titleEl = document.createElement('h1');
-        titleEl.textContent = title;
-        titleEl.style.cssText = 'font-size: 2em; margin-bottom: 0.5em;';
-        wrapper.appendChild(titleEl);
-
-        // Add byline if exists
-        if (byline) {
-          const bylineEl = document.createElement('div');
-          bylineEl.textContent = byline;
-          bylineEl.style.cssText = 'color: #666; font-style: italic; margin-bottom: 1em;';
-          wrapper.appendChild(bylineEl);
-        }
-
-        // Add article element back
-        wrapper.appendChild(articleElement);
-        document.body.appendChild(wrapper);
-
-        // Clean article styling
-        articleElement.style.cssText = `
-          background: transparent !important;
-          max-width: 100% !important;
-        `;
-
-        // Remove all images that are NOT in the article (or too small)
-        document.querySelectorAll('img').forEach(img => {
-          if (!articleImageSrcs.includes(img.src)) {
-            img.remove();
-          } else {
-            // Style article images
-            img.style.cssText = `
-              max-width: 100% !important;
-              height: auto !important;
-              display: block !important;
-              margin: 1em auto !important;
-            `;
-          }
-        });
-
-        // Style paragraphs
-        articleElement.querySelectorAll('p').forEach(p => {
-          p.style.margin = '1em 0';
-        });
-
-        // Remove navigation, ads, etc. that might still be in the article
-        const hideSelectors = [
-          'nav', 'header', 'footer', 'aside',
-          '[role="navigation"]', '[role="banner"]', '[role="complementary"]',
-          '.nav', '.navigation', '.menu', '.sidebar', '.ads', '.advertisement',
-          '.social-share', '.comments', '.related-posts', '.newsletter'
-        ];
-
-        hideSelectors.forEach(selector => {
-          articleElement.querySelectorAll(selector).forEach(el => el.remove());
-        });
-
-        return true;
-      } catch (e) {
-        console.error('Reader mode error:', e);
-        return false;
       }
     });
 
-    if (!readerModeApplied) {
-      console.warn('Could not apply reader mode, taking full page screenshot');
-    }
-
     await page.waitForTimeout(1000);
 
-    // Take screenshot
-    const fullScreenshotBuffer = await page.screenshot({
-      fullPage: true
-    });
-
+    const screenshot = await page.screenshot({ fullPage: true });
     await page.close();
 
-    // Set response headers
     res.setHeader('Content-Type', 'image/png');
     res.setHeader('Content-Disposition', 'attachment; filename="screenshot.png"');
-
-    res.send(fullScreenshotBuffer);
+    res.send(screenshot);
 
   } catch (error) {
     console.error('Screenshot error:', error);
@@ -350,141 +175,71 @@ app.get('/screenshot/images', async (req, res) => {
     page = await browser.newPage();
     await configurePage(page);
 
-    // Load the original page
     await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
     await scrollAndLoad(page);
 
-    // Get article images using inline article detection
-    const articleImageInfo = await page.evaluate(() => {
-      try {
-        // Remove popups first
-        const popupSelectors = [
-          '[class*="modal"]', '[id*="modal"]',
-          '[class*="popup"]', '[id*="popup"]',
-          '[class*="overlay"]', '[id*="overlay"]',
-          '[class*="cookie"]', '[id*="cookie"]',
-          '[class*="consent"]', '[id*="consent"]',
-          '[role="dialog"]', '[role="alertdialog"]'
-        ];
-
-        popupSelectors.forEach(selector => {
-          try {
-            document.querySelectorAll(selector).forEach(el => el.remove());
-          } catch (e) {}
-        });
-
-        // Remove high z-index fixed elements
-        document.querySelectorAll('*').forEach(el => {
-          const style = window.getComputedStyle(el);
-          if (style.position === 'fixed' || style.position === 'sticky') {
-            const zIndex = parseInt(style.zIndex) || 0;
-            if (zIndex > 1000) {
-              el.remove();
-            }
-          }
-        });
-
-        // Smart article detection algorithm
-        function scoreElement(el) {
-          let score = 0;
-          const tagName = el.tagName.toLowerCase();
-          const className = el.className || '';
-          const id = el.id || '';
-
-          // Positive signals
-          if (tagName === 'article') score += 100;
-          if (tagName === 'main') score += 80;
-          if (/article|content|post|entry|main|text|body/.test(className + id)) score += 50;
-
-          const paragraphs = el.getElementsByTagName('p').length;
-          score += paragraphs * 10;
-
-          const text = el.innerText || '';
-          score += Math.min(text.length / 10, 500);
-
-          const images = el.getElementsByTagName('img');
-          const contentImages = Array.from(images).filter(img => {
-            const w = img.naturalWidth || img.width || 0;
-            const h = img.naturalHeight || img.height || 0;
-            return w >= 200 && h >= 100;
-          });
-          score += contentImages.length * 20;
-
-          // Negative signals
-          if (/comment|widget|sidebar|footer|header|nav|menu|ad|banner/.test(className + id)) score -= 100;
-          if (tagName === 'nav' || tagName === 'aside' || tagName === 'header' || tagName === 'footer') score -= 50;
-
-          const links = el.getElementsByTagName('a').length;
-          if (paragraphs > 0 && links / paragraphs > 2) score -= 50;
-
-          return score;
-        }
-
-        // Find the best article element
-        const candidates = document.querySelectorAll('article, main, div, section, [role="main"]');
-        let articleElement = null;
-        let bestScore = 0;
-
-        candidates.forEach(el => {
-          const score = scoreElement(el);
-          if (score > bestScore && score > 100) {
-            bestScore = score;
-            articleElement = el;
-          }
-        });
-
-        if (!articleElement) {
-          return { success: false, images: [] };
-        }
-
-        // Get all images in the article
-        const images = Array.from(articleElement.querySelectorAll('img'));
-
-        // Filter out small images (likely icons, logos, etc.)
-        const contentImages = images.filter(img => {
-          const width = img.naturalWidth || img.width || 0;
-          const height = img.naturalHeight || img.height || 0;
-          // Only include images that are at least 200x100 pixels
-          return width >= 200 && height >= 100;
-        });
-
-        return {
-          success: true,
-          images: contentImages.map((img, idx) => ({
-            index: idx,
-            src: img.src,
-            alt: img.alt || '',
-            width: img.naturalWidth || img.width,
-            height: img.naturalHeight || img.height
-          }))
-        };
-
-      } catch (e) {
-        console.error('Image extraction error:', e);
-        return { success: false, images: [] };
-      }
-    });
-
-    if (!articleImageInfo.success || articleImageInfo.images.length === 0) {
-      await page.close();
-      return res.status(404).json({ error: 'No images found in the article content' });
+    // Try loading Readability
+    try {
+      await page.addScriptTag({ url: 'https://unpkg.com/@mozilla/readability@0.5.0/Readability.js' });
+    } catch (e) {
+      console.warn('CDN failed');
     }
 
-    // Now screenshot each image by index
+    await page.waitForTimeout(500);
+
+    // Get article images
+    const imageInfo = await page.evaluate(() => {
+      if (typeof Readability === 'undefined') {
+        return { success: false, images: [] };
+      }
+
+      // Remove popups
+      document.querySelectorAll('[class*="modal"], [class*="popup"], [role="dialog"]').forEach(el => el.remove());
+
+      const documentClone = document.cloneNode(true);
+      const reader = new Readability(documentClone);
+      const article = reader.parse();
+
+      if (!article) {
+        return { success: false, images: [] };
+      }
+
+      // Create temp div to parse article HTML
+      const tempDiv = document.createElement('div');
+      tempDiv.innerHTML = article.content;
+
+      const images = Array.from(tempDiv.querySelectorAll('img')).filter(img => {
+        const w = img.naturalWidth || img.width || 0;
+        const h = img.naturalHeight || img.height || 0;
+        return w >= 200 && h >= 100;
+      });
+
+      return {
+        success: true,
+        images: images.map((img, idx) => ({
+          index: idx,
+          src: img.src,
+          alt: img.alt || '',
+          width: img.naturalWidth || img.width,
+          height: img.naturalHeight || img.height
+        }))
+      };
+    });
+
+    if (!imageInfo.success || imageInfo.images.length === 0) {
+      await page.close();
+      return res.status(404).json({ error: 'No images found in article' });
+    }
+
     const imageBuffers = [];
-
-    for (let i = 0; i < articleImageInfo.images.length; i++) {
+    for (let i = 0; i < imageInfo.images.length; i++) {
       try {
-        const imgInfo = articleImageInfo.images[i];
-
-        // Find the image element by src
-        const imageElement = await page.$(`img[src="${imgInfo.src}"]`);
-
-        if (imageElement) {
-          const screenshotBuffer = await imageElement.screenshot();
+        const imgEl = await page.$(`img[src="${imageInfo.images[i].src}"]`);
+        if (imgEl) {
+          const buffer = await imgEl.screenshot();
           imageBuffers.push({
-            buffer: screenshotBuffer,
-            info: imgInfo
+            buffer,
+            info: imageInfo.images[i]
           });
         }
       } catch (err) {
@@ -494,13 +249,8 @@ app.get('/screenshot/images', async (req, res) => {
 
     await page.close();
 
-    if (imageBuffers.length === 0) {
-      return res.status(404).json({ error: 'Failed to capture image screenshots' });
-    }
-
-    // Return all images as array of base64 encoded binaries
     const imagesBase64 = imageBuffers.map((item, index) => ({
-      index: index,
+      index,
       filename: `image-${index}.png`,
       mimeType: 'image/png',
       data: item.buffer.toString('base64'),
@@ -538,7 +288,6 @@ async function shutdown() {
   process.exit(0);
 }
 
-// Handle various shutdown signals
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 process.on('SIGHUP', shutdown);
