@@ -1,7 +1,5 @@
 const express = require('express');
 const puppeteer = require('puppeteer');
-const { Readability } = require('@mozilla/readability');
-const { JSDOM } = require('jsdom');
 
 const app = express();
 const PORT = process.env.PORT || 3003;
@@ -101,79 +99,148 @@ app.get('/screenshot', async (req, res) => {
     page = await browser.newPage();
     await configurePage(page);
 
-    // Load the original page to extract content
+    // Load the original page
     await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
     await scrollAndLoad(page);
 
-    // Extract readable content with Readability
-    const html = await page.content();
-    const baseUrl = page.url();
+    // Inject Readability and apply reader mode directly on the page
+    const readerModeApplied = await page.evaluate(() => {
+      try {
+        // Clone the document to avoid modifying the original
+        const documentClone = document.cloneNode(true);
 
-    const dom = new JSDOM(html, { url: baseUrl });
-    const reader = new Readability(dom.window.document);
-    const article = reader.parse();
+        // Use Readability to parse (we need to inject it first)
+        // For now, let's use a simpler approach: find the main content area
 
-    if (!article) {
-      console.warn('Readability could not parse article, falling back to full page screenshot');
-      const fullScreenshotBuffer = await page.screenshot({ fullPage: true });
-      await page.close();
-      res.setHeader('Content-Type', 'image/png');
-      res.setHeader('Content-Disposition', 'attachment; filename="screenshot.png"');
-      return res.send(fullScreenshotBuffer);
+        // Common article selectors
+        const articleSelectors = [
+          'article',
+          '[role="main"]',
+          'main',
+          '.article-content',
+          '.post-content',
+          '.entry-content',
+          '#content',
+          '.content'
+        ];
+
+        let articleElement = null;
+        for (const selector of articleSelectors) {
+          articleElement = document.querySelector(selector);
+          if (articleElement) break;
+        }
+
+        if (!articleElement) {
+          // If no article found, try to find the element with most text content
+          const allElements = document.querySelectorAll('div, section, article');
+          let maxTextLength = 0;
+
+          allElements.forEach(el => {
+            const textLength = el.innerText?.length || 0;
+            if (textLength > maxTextLength) {
+              maxTextLength = textLength;
+              articleElement = el;
+            }
+          });
+        }
+
+        if (!articleElement) {
+          return false;
+        }
+
+        // Hide everything in body
+        document.body.style.cssText = `
+          margin: 0 !important;
+          padding: 40px 20px !important;
+          background: #fff !important;
+          font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif !important;
+          line-height: 1.6 !important;
+          color: #333 !important;
+        `;
+
+        // Hide all direct children of body
+        Array.from(document.body.children).forEach(child => {
+          if (!child.contains(articleElement)) {
+            child.style.display = 'none';
+          }
+        });
+
+        // Create a wrapper for the article
+        const wrapper = document.createElement('div');
+        wrapper.style.cssText = `
+          max-width: 800px !important;
+          margin: 0 auto !important;
+          padding: 0 !important;
+        `;
+
+        // Move article into wrapper
+        const articleParent = articleElement.parentNode;
+        articleParent.insertBefore(wrapper, articleElement);
+        wrapper.appendChild(articleElement);
+
+        // Clean up article styling
+        articleElement.style.cssText = `
+          background: transparent !important;
+          max-width: 100% !important;
+        `;
+
+        // Style images
+        const images = articleElement.querySelectorAll('img');
+        images.forEach(img => {
+          img.style.cssText = `
+            max-width: 100% !important;
+            height: auto !important;
+            display: block !important;
+            margin: 1em 0 !important;
+          `;
+        });
+
+        // Style paragraphs
+        const paragraphs = articleElement.querySelectorAll('p');
+        paragraphs.forEach(p => {
+          p.style.margin = '1em 0';
+        });
+
+        // Hide navigation, headers, footers, sidebars, ads
+        const hideSelectors = [
+          'nav', 'header', 'footer', 'aside',
+          '[role="navigation"]', '[role="banner"]', '[role="complementary"]',
+          '.nav', '.navigation', '.menu', '.sidebar', '.ads', '.advertisement',
+          '.social-share', '.comments', '.related-posts'
+        ];
+
+        hideSelectors.forEach(selector => {
+          document.querySelectorAll(selector).forEach(el => {
+            if (!articleElement.contains(el) || el.contains(articleElement)) {
+              el.style.display = 'none';
+            }
+          });
+        });
+
+        return true;
+      } catch (e) {
+        console.error('Reader mode error:', e);
+        return false;
+      }
+    });
+
+    if (!readerModeApplied) {
+      console.warn('Could not apply reader mode, taking full page screenshot');
     }
 
-    // Create a clean HTML page with the article content
-    const cleanHTML = `
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>${article.title || 'Article'}</title>
-  <style>
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
-      line-height: 1.6;
-      max-width: 800px;
-      margin: 0 auto;
-      padding: 40px 20px;
-      background: #fff;
-      color: #333;
-    }
-    h1 { font-size: 2em; margin-bottom: 0.5em; }
-    .byline { color: #666; font-style: italic; margin-bottom: 1em; }
-    img { max-width: 100%; height: auto; }
-    p { margin: 1em 0; }
-    a { color: #0066cc; text-decoration: none; }
-    a:hover { text-decoration: underline; }
-  </style>
-</head>
-<body>
-  <h1>${article.title || 'Article'}</h1>
-  ${article.byline ? `<div class="byline">${article.byline}</div>` : ''}
-  <div class="content">
-    ${article.content}
-  </div>
-</body>
-</html>`;
-
-    // Navigate to the clean HTML
-    await page.setContent(cleanHTML, { waitUntil: 'networkidle2' });
     await page.waitForTimeout(1000);
 
-    // Take screenshot of clean content
+    // Take screenshot
     const fullScreenshotBuffer = await page.screenshot({
       fullPage: true
     });
 
     await page.close();
 
-    // Set response headers for binary data
+    // Set response headers
     res.setHeader('Content-Type', 'image/png');
     res.setHeader('Content-Disposition', 'attachment; filename="screenshot.png"');
-    res.setHeader('X-Article-Title', encodeURIComponent(article.title || ''));
 
-    // Send the binary data
     res.send(fullScreenshotBuffer);
 
   } catch (error) {
@@ -198,98 +265,69 @@ app.get('/screenshot/images', async (req, res) => {
     page = await browser.newPage();
     await configurePage(page);
 
-    // Load the original page to extract content
+    // Load the original page
     await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
     await scrollAndLoad(page);
 
-    // Extract readable content with Readability
-    const html = await page.content();
-    const baseUrl = page.url();
+    // Find article images on the actual page (don't rebuild)
+    const articleImageSelectors = await page.evaluate(() => {
+      // Common article selectors
+      const articleSelectors = [
+        'article',
+        '[role="main"]',
+        'main',
+        '.article-content',
+        '.post-content',
+        '.entry-content',
+        '#content',
+        '.content'
+      ];
 
-    const dom = new JSDOM(html, { url: baseUrl });
-    const reader = new Readability(dom.window.document);
-    const article = reader.parse();
-
-    if (!article) {
-      console.warn('Readability could not parse article, falling back to all page images');
-      const imageElements = await page.$$('body img');
-      const imageBuffers = [];
-      for (let i = 0; i < imageElements.length; i++) {
-        try {
-          const screenshotBuffer = await imageElements[i].screenshot();
-          imageBuffers.push(screenshotBuffer);
-        } catch (err) {
-          console.error(`Failed to screenshot image ${i}:`, err.message);
-        }
-      }
-      await page.close();
-
-      if (imageBuffers.length === 0) {
-        return res.status(404).json({ error: 'No images found on the page' });
+      let articleElement = null;
+      for (const selector of articleSelectors) {
+        articleElement = document.querySelector(selector);
+        if (articleElement) break;
       }
 
-      const imagesBase64 = imageBuffers.map((buffer, index) => ({
-        index: index,
-        filename: `image-${index}.png`,
-        mimeType: 'image/png',
-        data: buffer.toString('base64')
-      }));
+      if (!articleElement) {
+        // If no article found, try to find the element with most text content
+        const allElements = document.querySelectorAll('div, section, article');
+        let maxTextLength = 0;
 
-      res.setHeader('Content-Type', 'application/json');
-      res.setHeader('X-Total-Images', imageBuffers.length.toString());
-      return res.json({
-        totalImages: imageBuffers.length,
-        images: imagesBase64
-      });
-    }
+        allElements.forEach(el => {
+          const textLength = el.innerText?.length || 0;
+          if (textLength > maxTextLength) {
+            maxTextLength = textLength;
+            articleElement = el;
+          }
+        });
+      }
 
-    // Create a clean HTML page with the article content
-    const cleanHTML = `
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>${article.title || 'Article'}</title>
-  <style>
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
-      line-height: 1.6;
-      max-width: 800px;
-      margin: 0 auto;
-      padding: 40px 20px;
-      background: #fff;
-      color: #333;
-    }
-    h1 { font-size: 2em; margin-bottom: 0.5em; }
-    .byline { color: #666; font-style: italic; margin-bottom: 1em; }
-    img { max-width: 100%; height: auto; }
-    p { margin: 1em 0; }
-    a { color: #0066cc; text-decoration: none; }
-    a:hover { text-decoration: underline; }
-  </style>
-</head>
-<body>
-  <h1>${article.title || 'Article'}</h1>
-  ${article.byline ? `<div class="byline">${article.byline}</div>` : ''}
-  <div class="content">
-    ${article.content}
-  </div>
-</body>
-</html>`;
+      // Get images from article only
+      if (articleElement) {
+        const images = Array.from(articleElement.querySelectorAll('img'));
+        return images.map(img => ({
+          src: img.src,
+          alt: img.alt || '',
+          width: img.naturalWidth || img.width,
+          height: img.naturalHeight || img.height
+        }));
+      }
 
-    // Navigate to the clean HTML
-    await page.setContent(cleanHTML, { waitUntil: 'networkidle2' });
-    await page.waitForTimeout(1000);
+      return [];
+    });
 
-    // Get all images from the cleaned content
-    const imageElements = await page.$$('body img');
+    // Screenshot each image element
+    const imageElements = await page.$$('article img, [role="main"] img, main img, .article-content img, .post-content img, .entry-content img');
     const imageBuffers = [];
 
     for (let i = 0; i < imageElements.length; i++) {
       try {
         const screenshotBuffer = await imageElements[i].screenshot();
-        imageBuffers.push(screenshotBuffer);
+        imageBuffers.push({
+          buffer: screenshotBuffer,
+          info: articleImageSelectors[i] || {}
+        });
       } catch (err) {
         console.error(`Failed to screenshot image ${i}:`, err.message);
       }
@@ -302,11 +340,13 @@ app.get('/screenshot/images', async (req, res) => {
     }
 
     // Return all images as array of base64 encoded binaries
-    const imagesBase64 = imageBuffers.map((buffer, index) => ({
+    const imagesBase64 = imageBuffers.map((item, index) => ({
       index: index,
       filename: `image-${index}.png`,
       mimeType: 'image/png',
-      data: buffer.toString('base64')
+      data: item.buffer.toString('base64'),
+      src: item.info.src || '',
+      alt: item.info.alt || ''
     }));
 
     res.setHeader('Content-Type', 'application/json');
