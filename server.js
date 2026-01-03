@@ -94,57 +94,104 @@ app.get('/screenshot', async (req, res) => {
     await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
     await scrollAndLoad(page);
 
-    // Try loading Readability from CDN
-    try {
-      await page.addScriptTag({ url: 'https://unpkg.com/@mozilla/readability@0.5.0/Readability.js' });
-    } catch (e) {
-      console.warn('CDN failed, using fallback');
+    // Remove popups/modals first (before loading Readability)
+    await page.evaluate(() => {
+      document.querySelectorAll('[class*="modal"], [class*="popup"], [class*="overlay"], [class*="cookie"], [role="dialog"]').forEach(el => el.remove());
+      document.querySelectorAll('*').forEach(el => {
+        const style = window.getComputedStyle(el);
+        if ((style.position === 'fixed' || style.position === 'sticky') && parseInt(style.zIndex || 0) > 1000) {
+          el.remove();
+        }
+      });
+    });
+
+    // Try loading Readability from multiple CDNs
+    let readabilityLoaded = false;
+    const cdns = [
+      'https://unpkg.com/@mozilla/readability@0.5.0/Readability.js',
+      'https://cdn.jsdelivr.net/npm/@mozilla/readability@0.5.0/Readability.js'
+    ];
+
+    for (const cdn of cdns) {
+      try {
+        await page.addScriptTag({ url: cdn });
+        readabilityLoaded = true;
+        console.log('Readability loaded from:', cdn);
+        break;
+      } catch (e) {
+        console.warn(`Failed to load from ${cdn}`);
+      }
+    }
+
+    if (!readabilityLoaded) {
+      await page.close();
+      return res.status(500).json({ error: 'Failed to load Readability library from CDN' });
     }
 
     await page.waitForTimeout(500);
 
     // Apply Readability
-    await page.evaluate(() => {
-      if (typeof Readability !== 'undefined') {
-        // Remove popups/modals
-        document.querySelectorAll('[class*="modal"], [class*="popup"], [class*="overlay"], [class*="cookie"], [role="dialog"]').forEach(el => el.remove());
-        document.querySelectorAll('*').forEach(el => {
-          const style = window.getComputedStyle(el);
-          if ((style.position === 'fixed' || style.position === 'sticky') && parseInt(style.zIndex || 0) > 1000) {
-            el.remove();
-          }
-        });
-
-        // Parse with Readability
-        const documentClone = document.cloneNode(true);
-        const reader = new Readability(documentClone);
-        const article = reader.parse();
-
-        if (article) {
-          // Replace entire body with clean article HTML
-          document.body.innerHTML = `
-            <div style="max-width: 800px; margin: 0 auto; padding: 40px 20px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; background: #fff; color: #333;">
-              <h1 style="font-size: 2em; margin-bottom: 0.5em;">${article.title}</h1>
-              ${article.byline ? `<div style="color: #666; font-style: italic; margin-bottom: 1em;">${article.byline}</div>` : ''}
-              <div style="font-size: 1.1em;">
-                ${article.content}
-              </div>
-            </div>
-          `;
-
-          // Style images
-          document.querySelectorAll('img').forEach(img => {
-            img.style.cssText = 'max-width: 100% !important; height: auto !important; display: block !important; margin: 1em auto !important;';
-          });
-
-          document.querySelectorAll('p').forEach(p => {
-            p.style.margin = '1em 0';
-          });
-        }
+    const articleParsed = await page.evaluate(() => {
+      if (typeof Readability === 'undefined') {
+        return { success: false };
       }
+
+      // Parse with Readability
+      const documentClone = document.cloneNode(true);
+      const reader = new Readability(documentClone);
+      const article = reader.parse();
+
+      if (!article) {
+        return { success: false };
+      }
+
+      // Replace entire body with clean article HTML
+      document.body.innerHTML = `
+        <div style="max-width: 800px; margin: 0 auto; padding: 40px 20px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; background: #fff; color: #333;">
+          <h1 style="font-size: 2em; margin-bottom: 0.5em;">${article.title}</h1>
+          ${article.byline ? `<div style="color: #666; font-style: italic; margin-bottom: 1em;">${article.byline}</div>` : ''}
+          <div style="font-size: 1.1em;">
+            ${article.content}
+          </div>
+        </div>
+      `;
+
+      // Fix lazy-loaded images and style them
+      document.querySelectorAll('img').forEach(img => {
+        // Handle lazy loading attributes
+        if (!img.src || img.src.includes('data:image')) {
+          const possibleSrc = img.getAttribute('data-src') ||
+                            img.getAttribute('data-lazy-src') ||
+                            img.getAttribute('data-original') ||
+                            img.getAttribute('data-srcset')?.split(' ')[0];
+          if (possibleSrc) {
+            img.src = possibleSrc;
+          }
+        }
+
+        // Remove lazy loading attributes
+        img.removeAttribute('loading');
+        img.removeAttribute('data-src');
+        img.removeAttribute('data-lazy-src');
+
+        // Style images
+        img.style.cssText = 'max-width: 100% !important; height: auto !important; display: block !important; margin: 1em auto !important;';
+      });
+
+      document.querySelectorAll('p').forEach(p => {
+        p.style.margin = '1em 0';
+      });
+
+      return { success: true };
     });
 
-    await page.waitForTimeout(1000);
+    if (!articleParsed.success) {
+      await page.close();
+      return res.status(500).json({ error: 'Failed to parse article with Readability' });
+    }
+
+    // Wait for images to load
+    await page.waitForTimeout(2000);
 
     const screenshot = await page.screenshot({ fullPage: true });
     await page.close();
@@ -178,11 +225,37 @@ app.get('/screenshot/images', async (req, res) => {
     await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
     await scrollAndLoad(page);
 
-    // Try loading Readability
-    try {
-      await page.addScriptTag({ url: 'https://unpkg.com/@mozilla/readability@0.5.0/Readability.js' });
-    } catch (e) {
-      console.warn('CDN failed');
+    // Remove popups first
+    await page.evaluate(() => {
+      document.querySelectorAll('[class*="modal"], [class*="popup"], [class*="overlay"], [class*="cookie"], [role="dialog"]').forEach(el => el.remove());
+      document.querySelectorAll('*').forEach(el => {
+        const style = window.getComputedStyle(el);
+        if ((style.position === 'fixed' || style.position === 'sticky') && parseInt(style.zIndex || 0) > 1000) {
+          el.remove();
+        }
+      });
+    });
+
+    // Try loading Readability from multiple CDNs
+    let readabilityLoaded = false;
+    const cdns = [
+      'https://unpkg.com/@mozilla/readability@0.5.0/Readability.js',
+      'https://cdn.jsdelivr.net/npm/@mozilla/readability@0.5.0/Readability.js'
+    ];
+
+    for (const cdn of cdns) {
+      try {
+        await page.addScriptTag({ url: cdn });
+        readabilityLoaded = true;
+        break;
+      } catch (e) {
+        console.warn(`Failed to load from ${cdn}`);
+      }
+    }
+
+    if (!readabilityLoaded) {
+      await page.close();
+      return res.status(500).json({ error: 'Failed to load Readability library' });
     }
 
     await page.waitForTimeout(500);
@@ -192,9 +265,6 @@ app.get('/screenshot/images', async (req, res) => {
       if (typeof Readability === 'undefined') {
         return { success: false, images: [] };
       }
-
-      // Remove popups
-      document.querySelectorAll('[class*="modal"], [class*="popup"], [role="dialog"]').forEach(el => el.remove());
 
       const documentClone = document.cloneNode(true);
       const reader = new Readability(documentClone);
@@ -208,20 +278,38 @@ app.get('/screenshot/images', async (req, res) => {
       const tempDiv = document.createElement('div');
       tempDiv.innerHTML = article.content;
 
-      const images = Array.from(tempDiv.querySelectorAll('img')).filter(img => {
-        const w = img.naturalWidth || img.width || 0;
-        const h = img.naturalHeight || img.height || 0;
+      const images = Array.from(tempDiv.querySelectorAll('img'));
+
+      // Fix lazy-loaded images
+      images.forEach(img => {
+        if (!img.src || img.src.includes('data:image')) {
+          const possibleSrc = img.getAttribute('data-src') ||
+                            img.getAttribute('data-lazy-src') ||
+                            img.getAttribute('data-original') ||
+                            img.getAttribute('data-srcset')?.split(' ')[0];
+          if (possibleSrc) {
+            img.src = possibleSrc;
+          }
+        }
+      });
+
+      const contentImages = images.filter(img => {
+        const src = img.src || img.getAttribute('data-src') || '';
+        if (!src || src.includes('data:image')) return false;
+
+        const w = img.naturalWidth || img.width || parseInt(img.getAttribute('width')) || 0;
+        const h = img.naturalHeight || img.height || parseInt(img.getAttribute('height')) || 0;
         return w >= 200 && h >= 100;
       });
 
       return {
         success: true,
-        images: images.map((img, idx) => ({
+        images: contentImages.map((img, idx) => ({
           index: idx,
-          src: img.src,
+          src: img.src || img.getAttribute('data-src') || '',
           alt: img.alt || '',
-          width: img.naturalWidth || img.width,
-          height: img.naturalHeight || img.height
+          width: img.naturalWidth || img.width || parseInt(img.getAttribute('width')) || 0,
+          height: img.naturalHeight || img.height || parseInt(img.getAttribute('height')) || 0
         }))
       };
     });
