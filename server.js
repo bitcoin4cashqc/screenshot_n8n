@@ -1,8 +1,13 @@
 const express = require('express');
 const puppeteer = require('puppeteer');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3003;
+
+// Read Readability.js once at startup
+const READABILITY_JS = fs.readFileSync(path.join(__dirname, 'readability.js'), 'utf8');
 
 // Global browser instance
 let browser = null;
@@ -105,30 +110,8 @@ app.get('/screenshot', async (req, res) => {
       });
     });
 
-    // Try loading Readability from multiple CDNs
-    let readabilityLoaded = false;
-    const cdns = [
-      'https://unpkg.com/@mozilla/readability@0.5.0/Readability.js',
-      'https://cdn.jsdelivr.net/npm/@mozilla/readability@0.5.0/Readability.js'
-    ];
-
-    for (const cdn of cdns) {
-      try {
-        await page.addScriptTag({ url: cdn });
-        readabilityLoaded = true;
-        console.log('Readability loaded from:', cdn);
-        break;
-      } catch (e) {
-        console.warn(`Failed to load from ${cdn}`);
-      }
-    }
-
-    if (!readabilityLoaded) {
-      await page.close();
-      return res.status(500).json({ error: 'Failed to load Readability library from CDN' });
-    }
-
-    await page.waitForTimeout(500);
+    // Inject Readability directly from local file
+    await page.addScriptTag({ content: READABILITY_JS });
 
     // Apply Readability
     const articleParsed = await page.evaluate(() => {
@@ -158,21 +141,25 @@ app.get('/screenshot', async (req, res) => {
 
       // Fix lazy-loaded images and style them
       document.querySelectorAll('img').forEach(img => {
-        // Handle lazy loading attributes
-        if (!img.src || img.src.includes('data:image')) {
-          const possibleSrc = img.getAttribute('data-src') ||
-                            img.getAttribute('data-lazy-src') ||
-                            img.getAttribute('data-original') ||
-                            img.getAttribute('data-srcset')?.split(' ')[0];
-          if (possibleSrc) {
-            img.src = possibleSrc;
-          }
+        // Try to find the real image source from various attributes
+        const possibleSrc = img.src && !img.src.includes('data:') && !img.src.includes('placeholder') ? img.src :
+                          img.getAttribute('data-src') ||
+                          img.getAttribute('data-lazy-src') ||
+                          img.getAttribute('data-original') ||
+                          img.getAttribute('data-srcset')?.split(' ')[0] ||
+                          img.getAttribute('srcset')?.split(' ')[0];
+
+        if (possibleSrc && possibleSrc !== img.src) {
+          img.src = possibleSrc;
+          // Force image to load
+          img.loading = 'eager';
         }
 
         // Remove lazy loading attributes
         img.removeAttribute('loading');
         img.removeAttribute('data-src');
         img.removeAttribute('data-lazy-src');
+        img.removeAttribute('data-original');
 
         // Style images
         img.style.cssText = 'max-width: 100% !important; height: auto !important; display: block !important; margin: 1em auto !important;';
@@ -191,7 +178,20 @@ app.get('/screenshot', async (req, res) => {
     }
 
     // Wait for images to load
-    await page.waitForTimeout(2000);
+    await page.waitForTimeout(3000);
+
+    // Wait for all images to actually load
+    await page.evaluate(() => {
+      return Promise.all(
+        Array.from(document.images)
+          .filter(img => !img.complete)
+          .map(img => new Promise(resolve => {
+            img.onload = img.onerror = resolve;
+          }))
+      );
+    });
+
+    await page.waitForTimeout(1000);
 
     const screenshot = await page.screenshot({ fullPage: true });
     await page.close();
@@ -236,29 +236,8 @@ app.get('/screenshot/images', async (req, res) => {
       });
     });
 
-    // Try loading Readability from multiple CDNs
-    let readabilityLoaded = false;
-    const cdns = [
-      'https://unpkg.com/@mozilla/readability@0.5.0/Readability.js',
-      'https://cdn.jsdelivr.net/npm/@mozilla/readability@0.5.0/Readability.js'
-    ];
-
-    for (const cdn of cdns) {
-      try {
-        await page.addScriptTag({ url: cdn });
-        readabilityLoaded = true;
-        break;
-      } catch (e) {
-        console.warn(`Failed to load from ${cdn}`);
-      }
-    }
-
-    if (!readabilityLoaded) {
-      await page.close();
-      return res.status(500).json({ error: 'Failed to load Readability library' });
-    }
-
-    await page.waitForTimeout(500);
+    // Inject Readability directly from local file
+    await page.addScriptTag({ content: READABILITY_JS });
 
     // Get article images
     const imageInfo = await page.evaluate(() => {
