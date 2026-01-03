@@ -12,7 +12,6 @@ const READABILITY_JS = fs.readFileSync(path.join(__dirname, 'readability.js'), '
 // Global browser instance
 let browser = null;
 
-// Browser configuration
 const BROWSER_ARGS = [
   '--no-sandbox',
   '--disable-setuid-sandbox',
@@ -25,7 +24,6 @@ const BROWSER_ARGS = [
   '--disable-features=IsolateOrigins,site-per-process'
 ];
 
-// Initialize browser on startup
 async function initBrowser() {
   try {
     console.log('Launching Chrome browser...');
@@ -40,7 +38,6 @@ async function initBrowser() {
   }
 }
 
-// Helper function to configure a new page
 async function configurePage(page) {
   await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
 
@@ -59,7 +56,6 @@ async function configurePage(page) {
   await page.setViewport({ width: 1920, height: 1080 });
 }
 
-// Helper function to scroll and load content
 async function scrollAndLoad(page) {
   await page.waitForTimeout(3000);
 
@@ -99,7 +95,7 @@ app.get('/screenshot', async (req, res) => {
     await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
     await scrollAndLoad(page);
 
-    // Remove popups/modals first (before loading Readability)
+    // Remove popups/modals first
     await page.evaluate(() => {
       document.querySelectorAll('[class*="modal"], [class*="popup"], [class*="overlay"], [class*="cookie"], [role="dialog"]').forEach(el => el.remove());
       document.querySelectorAll('*').forEach(el => {
@@ -110,88 +106,101 @@ app.get('/screenshot', async (req, res) => {
       });
     });
 
-    // Inject Readability directly from local file
+    // Inject Readability
     await page.addScriptTag({ content: READABILITY_JS });
 
-    // Apply Readability
-    const articleParsed = await page.evaluate(() => {
+    // Apply reader mode - DON'T replace innerHTML, just hide non-article content
+    const articleFound = await page.evaluate(() => {
       if (typeof Readability === 'undefined') {
-        return { success: false };
+        return false;
       }
 
-      // Parse with Readability
+      // Parse with Readability using CLONED document (don't modify original)
       const documentClone = document.cloneNode(true);
       const reader = new Readability(documentClone);
       const article = reader.parse();
 
       if (!article) {
-        return { success: false };
+        return false;
       }
 
-      // Replace entire body with clean article HTML
-      document.body.innerHTML = `
-        <div style="max-width: 800px; margin: 0 auto; padding: 40px 20px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; background: #fff; color: #333;">
-          <h1 style="font-size: 2em; margin-bottom: 0.5em;">${article.title}</h1>
-          ${article.byline ? `<div style="color: #666; font-style: italic; margin-bottom: 1em;">${article.byline}</div>` : ''}
-          <div style="font-size: 1.1em;">
-            ${article.content}
-          </div>
-        </div>
-      `;
+      // Find the article element in the ACTUAL DOM (not the clone)
+      // We'll use a simple heuristic: find the element with most paragraph text
+      let articleElement = null;
+      let maxTextLength = 0;
 
-      // Fix lazy-loaded images and style them
-      document.querySelectorAll('img').forEach(img => {
-        // Try to find the real image source from various attributes
-        const possibleSrc = img.src && !img.src.includes('data:') && !img.src.includes('placeholder') ? img.src :
-                          img.getAttribute('data-src') ||
-                          img.getAttribute('data-lazy-src') ||
-                          img.getAttribute('data-original') ||
-                          img.getAttribute('data-srcset')?.split(' ')[0] ||
-                          img.getAttribute('srcset')?.split(' ')[0];
+      document.querySelectorAll('article, main, [role="main"], div').forEach(el => {
+        const paragraphs = el.querySelectorAll('p');
+        const textLength = Array.from(paragraphs).reduce((sum, p) => sum + (p.textContent?.length || 0), 0);
 
-        if (possibleSrc && possibleSrc !== img.src) {
-          img.src = possibleSrc;
-          // Force image to load
-          img.loading = 'eager';
+        if (textLength > maxTextLength && textLength > 200) {
+          maxTextLength = textLength;
+          articleElement = el;
         }
+      });
 
-        // Remove lazy loading attributes
-        img.removeAttribute('loading');
-        img.removeAttribute('data-src');
-        img.removeAttribute('data-lazy-src');
-        img.removeAttribute('data-original');
+      if (!articleElement) {
+        return false;
+      }
 
-        // Style images
+      // Hide EVERYTHING except the article
+      document.body.style.cssText = 'margin: 0 !important; padding: 40px 20px !important; background: #fff !important; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important; line-height: 1.6 !important; color: #333 !important;';
+
+      // Hide all top-level body children except the one containing the article
+      Array.from(document.body.children).forEach(child => {
+        if (!child.contains(articleElement) && child !== articleElement) {
+          child.style.display = 'none';
+        }
+      });
+
+      // Create wrapper for article
+      const wrapper = document.createElement('div');
+      wrapper.style.cssText = 'max-width: 800px !important; margin: 0 auto !important; padding: 0 !important;';
+
+      // Add title from Readability
+      const title = document.createElement('h1');
+      title.textContent = article.title;
+      title.style.cssText = 'font-size: 2em; margin-bottom: 0.5em; color: #333;';
+      wrapper.appendChild(title);
+
+      // Add byline if available
+      if (article.byline) {
+        const byline = document.createElement('div');
+        byline.textContent = article.byline;
+        byline.style.cssText = 'color: #666; font-style: italic; margin-bottom: 1em;';
+        wrapper.appendChild(byline);
+      }
+
+      // Move article element into wrapper
+      const articleParent = articleElement.parentNode;
+      articleParent.insertBefore(wrapper, articleElement);
+      wrapper.appendChild(articleElement);
+
+      // Style the article content
+      articleElement.style.cssText = 'background: transparent !important; max-width: 100% !important;';
+
+      // Remove unwanted elements from WITHIN the article
+      articleElement.querySelectorAll('nav, header, footer, aside, [role="navigation"], [role="banner"], [class*="related"], [class*="comment"], [class*="social"], [class*="share"], [class*="newsletter"]').forEach(el => el.remove());
+
+      // Style images - DON'T change src, just style them
+      articleElement.querySelectorAll('img').forEach(img => {
         img.style.cssText = 'max-width: 100% !important; height: auto !important; display: block !important; margin: 1em auto !important;';
       });
 
-      document.querySelectorAll('p').forEach(p => {
-        p.style.margin = '1em 0';
+      // Style paragraphs
+      articleElement.querySelectorAll('p').forEach(p => {
+        p.style.cssText = 'margin: 1em 0; font-size: 1.1em;';
       });
 
-      return { success: true };
+      return true;
     });
 
-    if (!articleParsed.success) {
-      await page.close();
-      return res.status(500).json({ error: 'Failed to parse article with Readability' });
+    if (!articleFound) {
+      console.warn('Could not parse article with Readability');
     }
 
-    // Wait for images to load
-    await page.waitForTimeout(3000);
-
-    // Wait for all images to actually load
-    await page.evaluate(() => {
-      return Promise.all(
-        Array.from(document.images)
-          .filter(img => !img.complete)
-          .map(img => new Promise(resolve => {
-            img.onload = img.onerror = resolve;
-          }))
-      );
-    });
-
-    await page.waitForTimeout(1000);
+    // Wait for any remaining images to load
+    await page.waitForTimeout(2000);
 
     const screenshot = await page.screenshot({ fullPage: true });
     await page.close();
@@ -225,21 +234,12 @@ app.get('/screenshot/images', async (req, res) => {
     await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
     await scrollAndLoad(page);
 
-    // Remove popups first
     await page.evaluate(() => {
-      document.querySelectorAll('[class*="modal"], [class*="popup"], [class*="overlay"], [class*="cookie"], [role="dialog"]').forEach(el => el.remove());
-      document.querySelectorAll('*').forEach(el => {
-        const style = window.getComputedStyle(el);
-        if ((style.position === 'fixed' || style.position === 'sticky') && parseInt(style.zIndex || 0) > 1000) {
-          el.remove();
-        }
-      });
+      document.querySelectorAll('[class*="modal"], [class*="popup"], [role="dialog"]').forEach(el => el.remove());
     });
 
-    // Inject Readability directly from local file
     await page.addScriptTag({ content: READABILITY_JS });
 
-    // Get article images
     const imageInfo = await page.evaluate(() => {
       if (typeof Readability === 'undefined') {
         return { success: false, images: [] };
@@ -253,42 +253,39 @@ app.get('/screenshot/images', async (req, res) => {
         return { success: false, images: [] };
       }
 
-      // Create temp div to parse article HTML
-      const tempDiv = document.createElement('div');
-      tempDiv.innerHTML = article.content;
+      // Find article element in actual DOM
+      let articleElement = null;
+      let maxTextLength = 0;
 
-      const images = Array.from(tempDiv.querySelectorAll('img'));
+      document.querySelectorAll('article, main, [role="main"], div').forEach(el => {
+        const paragraphs = el.querySelectorAll('p');
+        const textLength = Array.from(paragraphs).reduce((sum, p) => sum + (p.textContent?.length || 0), 0);
 
-      // Fix lazy-loaded images
-      images.forEach(img => {
-        if (!img.src || img.src.includes('data:image')) {
-          const possibleSrc = img.getAttribute('data-src') ||
-                            img.getAttribute('data-lazy-src') ||
-                            img.getAttribute('data-original') ||
-                            img.getAttribute('data-srcset')?.split(' ')[0];
-          if (possibleSrc) {
-            img.src = possibleSrc;
-          }
+        if (textLength > maxTextLength && textLength > 200) {
+          maxTextLength = textLength;
+          articleElement = el;
         }
       });
 
-      const contentImages = images.filter(img => {
-        const src = img.src || img.getAttribute('data-src') || '';
-        if (!src || src.includes('data:image')) return false;
+      if (!articleElement) {
+        return { success: false, images: [] };
+      }
 
-        const w = img.naturalWidth || img.width || parseInt(img.getAttribute('width')) || 0;
-        const h = img.naturalHeight || img.height || parseInt(img.getAttribute('height')) || 0;
+      // Get images from the ACTUAL article element in DOM
+      const images = Array.from(articleElement.querySelectorAll('img')).filter(img => {
+        const w = img.naturalWidth || img.width || 0;
+        const h = img.naturalHeight || img.height || 0;
         return w >= 200 && h >= 100;
       });
 
       return {
         success: true,
-        images: contentImages.map((img, idx) => ({
+        images: images.map((img, idx) => ({
           index: idx,
-          src: img.src || img.getAttribute('data-src') || '',
+          src: img.src,
           alt: img.alt || '',
-          width: img.naturalWidth || img.width || parseInt(img.getAttribute('width')) || 0,
-          height: img.naturalHeight || img.height || parseInt(img.getAttribute('height')) || 0
+          width: img.naturalWidth || img.width,
+          height: img.naturalHeight || img.height
         }))
       };
     });
@@ -345,7 +342,6 @@ app.get('/screenshot/images', async (req, res) => {
   }
 });
 
-// Graceful shutdown
 async function shutdown() {
   console.log('\nShutting down gracefully...');
   if (browser) {
@@ -359,7 +355,6 @@ process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 process.on('SIGHUP', shutdown);
 
-// Start server after browser initialization
 initBrowser().then(() => {
   app.listen(PORT, () => {
     console.log(`Screenshot server running on port ${PORT}`);
