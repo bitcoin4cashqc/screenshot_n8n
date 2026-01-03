@@ -103,14 +103,7 @@ app.get('/screenshot', async (req, res) => {
     await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
     await scrollAndLoad(page);
 
-    // Inject Readability.js from CDN
-    await page.addScriptTag({
-      url: 'https://cdn.jsdelivr.net/npm/@mozilla/readability@0.5.0/Readability.min.js'
-    });
-
-    await page.waitForTimeout(500);
-
-    // Apply reader mode using actual Readability
+    // Apply reader mode using inline article detection
     const readerModeApplied = await page.evaluate(() => {
       try {
         // First, remove all popups, modals, overlays, cookie banners
@@ -150,67 +143,85 @@ app.get('/screenshot', async (req, res) => {
           }
         });
 
-        // Clone the document for Readability
-        const documentClone = document.cloneNode(true);
+        // Smart article detection algorithm
+        function scoreElement(el) {
+          let score = 0;
+          const tagName = el.tagName.toLowerCase();
+          const className = el.className || '';
+          const id = el.id || '';
 
-        // Check if Readability is available
-        if (typeof Readability === 'undefined') {
-          console.error('Readability not loaded');
-          return false;
-        }
+          // Positive signals for article content
+          if (tagName === 'article') score += 100;
+          if (tagName === 'main') score += 80;
+          if (/article|content|post|entry|main|text|body/.test(className + id)) score += 50;
 
-        // Parse with Readability
-        const reader = new Readability(documentClone);
-        const article = reader.parse();
+          // Count paragraphs (good signal)
+          const paragraphs = el.getElementsByTagName('p').length;
+          score += paragraphs * 10;
 
-        if (!article) {
-          console.error('Readability could not parse article');
-          return false;
-        }
+          // Text length (very important)
+          const text = el.innerText || '';
+          score += Math.min(text.length / 10, 500);
 
-        // Find the original article element in the actual DOM
-        // We'll use the title to help identify it
-        let articleElement = null;
-
-        // Try to find by article tag first
-        const articles = document.querySelectorAll('article, [role="main"], main');
-        for (const el of articles) {
-          if (el.innerText && el.innerText.length > 500) {
-            articleElement = el;
-            break;
-          }
-        }
-
-        // If not found, find the element with the most matching text
-        if (!articleElement) {
-          const allElements = document.querySelectorAll('div, section, article');
-          let bestMatch = null;
-          let maxScore = 0;
-
-          allElements.forEach(el => {
-            const text = el.innerText || '';
-            const textLength = text.length;
-
-            // Calculate score based on text length and presence of paragraphs
-            const paragraphs = el.querySelectorAll('p').length;
-            const score = textLength + (paragraphs * 100);
-
-            if (score > maxScore && textLength > 500) {
-              maxScore = score;
-              bestMatch = el;
-            }
+          // Images are good for articles
+          const images = el.getElementsByTagName('img');
+          const contentImages = Array.from(images).filter(img => {
+            const w = img.naturalWidth || img.width || 0;
+            const h = img.naturalHeight || img.height || 0;
+            return w >= 200 && h >= 100;
           });
+          score += contentImages.length * 20;
 
-          articleElement = bestMatch;
+          // Negative signals
+          if (/comment|widget|sidebar|footer|header|nav|menu|ad|banner/.test(className + id)) score -= 100;
+          if (tagName === 'nav' || tagName === 'aside' || tagName === 'header' || tagName === 'footer') score -= 50;
+
+          // Links vs text ratio (too many links = not article)
+          const links = el.getElementsByTagName('a').length;
+          if (paragraphs > 0 && links / paragraphs > 2) score -= 50;
+
+          return score;
         }
 
+        // Find the best article element
+        const candidates = document.querySelectorAll('article, main, div, section, [role="main"]');
+        let articleElement = null;
+        let bestScore = 0;
+
+        candidates.forEach(el => {
+          const score = scoreElement(el);
+          if (score > bestScore && score > 100) {
+            bestScore = score;
+            articleElement = el;
+          }
+        });
+
         if (!articleElement) {
+          console.error('Could not find article element');
           return false;
         }
 
-        // Get all images in the article
+        // Get title from the page
+        let title = document.querySelector('h1')?.innerText ||
+                   document.querySelector('[property="og:title"]')?.content ||
+                   document.querySelector('title')?.innerText ||
+                   'Article';
+
+        // Get byline/author
+        let byline = document.querySelector('[rel="author"]')?.innerText ||
+                    document.querySelector('[class*="author"]')?.innerText ||
+                    document.querySelector('[property="article:author"]')?.content ||
+                    '';
+
+        // Get all images in the article BEFORE we modify DOM
         const articleImages = Array.from(articleElement.querySelectorAll('img'));
-        const articleImageSrcs = articleImages.map(img => img.src);
+        const articleImageSrcs = articleImages
+          .filter(img => {
+            const w = img.naturalWidth || img.width || 0;
+            const h = img.naturalHeight || img.height || 0;
+            return w >= 200 && h >= 100; // Filter out small images
+          })
+          .map(img => img.src);
 
         // Style the body
         document.body.style.cssText = `
@@ -237,14 +248,14 @@ app.get('/screenshot', async (req, res) => {
 
         // Add title
         const titleEl = document.createElement('h1');
-        titleEl.textContent = article.title;
+        titleEl.textContent = title;
         titleEl.style.cssText = 'font-size: 2em; margin-bottom: 0.5em;';
         wrapper.appendChild(titleEl);
 
         // Add byline if exists
-        if (article.byline) {
+        if (byline) {
           const bylineEl = document.createElement('div');
-          bylineEl.textContent = article.byline;
+          bylineEl.textContent = byline;
           bylineEl.style.cssText = 'color: #666; font-style: italic; margin-bottom: 1em;';
           wrapper.appendChild(bylineEl);
         }
@@ -259,7 +270,7 @@ app.get('/screenshot', async (req, res) => {
           max-width: 100% !important;
         `;
 
-        // Remove all images that are NOT in the article
+        // Remove all images that are NOT in the article (or too small)
         document.querySelectorAll('img').forEach(img => {
           if (!articleImageSrcs.includes(img.src)) {
             img.remove();
@@ -343,14 +354,7 @@ app.get('/screenshot/images', async (req, res) => {
     await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
     await scrollAndLoad(page);
 
-    // Inject Readability.js from CDN
-    await page.addScriptTag({
-      url: 'https://cdn.jsdelivr.net/npm/@mozilla/readability@0.5.0/Readability.min.js'
-    });
-
-    await page.waitForTimeout(500);
-
-    // Get article images using Readability
+    // Get article images using inline article detection
     const articleImageInfo = await page.evaluate(() => {
       try {
         // Remove popups first
@@ -369,50 +373,65 @@ app.get('/screenshot/images', async (req, res) => {
           } catch (e) {}
         });
 
-        // Clone and parse with Readability
-        const documentClone = document.cloneNode(true);
-
-        if (typeof Readability === 'undefined') {
-          return { success: false, images: [] };
-        }
-
-        const reader = new Readability(documentClone);
-        const article = reader.parse();
-
-        if (!article) {
-          return { success: false, images: [] };
-        }
-
-        // Find the article element in the actual DOM
-        let articleElement = null;
-        const articles = document.querySelectorAll('article, [role="main"], main');
-
-        for (const el of articles) {
-          if (el.innerText && el.innerText.length > 500) {
-            articleElement = el;
-            break;
-          }
-        }
-
-        if (!articleElement) {
-          const allElements = document.querySelectorAll('div, section, article');
-          let bestMatch = null;
-          let maxScore = 0;
-
-          allElements.forEach(el => {
-            const text = el.innerText || '';
-            const textLength = text.length;
-            const paragraphs = el.querySelectorAll('p').length;
-            const score = textLength + (paragraphs * 100);
-
-            if (score > maxScore && textLength > 500) {
-              maxScore = score;
-              bestMatch = el;
+        // Remove high z-index fixed elements
+        document.querySelectorAll('*').forEach(el => {
+          const style = window.getComputedStyle(el);
+          if (style.position === 'fixed' || style.position === 'sticky') {
+            const zIndex = parseInt(style.zIndex) || 0;
+            if (zIndex > 1000) {
+              el.remove();
             }
-          });
+          }
+        });
 
-          articleElement = bestMatch;
+        // Smart article detection algorithm
+        function scoreElement(el) {
+          let score = 0;
+          const tagName = el.tagName.toLowerCase();
+          const className = el.className || '';
+          const id = el.id || '';
+
+          // Positive signals
+          if (tagName === 'article') score += 100;
+          if (tagName === 'main') score += 80;
+          if (/article|content|post|entry|main|text|body/.test(className + id)) score += 50;
+
+          const paragraphs = el.getElementsByTagName('p').length;
+          score += paragraphs * 10;
+
+          const text = el.innerText || '';
+          score += Math.min(text.length / 10, 500);
+
+          const images = el.getElementsByTagName('img');
+          const contentImages = Array.from(images).filter(img => {
+            const w = img.naturalWidth || img.width || 0;
+            const h = img.naturalHeight || img.height || 0;
+            return w >= 200 && h >= 100;
+          });
+          score += contentImages.length * 20;
+
+          // Negative signals
+          if (/comment|widget|sidebar|footer|header|nav|menu|ad|banner/.test(className + id)) score -= 100;
+          if (tagName === 'nav' || tagName === 'aside' || tagName === 'header' || tagName === 'footer') score -= 50;
+
+          const links = el.getElementsByTagName('a').length;
+          if (paragraphs > 0 && links / paragraphs > 2) score -= 50;
+
+          return score;
         }
+
+        // Find the best article element
+        const candidates = document.querySelectorAll('article, main, div, section, [role="main"]');
+        let articleElement = null;
+        let bestScore = 0;
+
+        candidates.forEach(el => {
+          const score = scoreElement(el);
+          if (score > bestScore && score > 100) {
+            bestScore = score;
+            articleElement = el;
+          }
+        });
 
         if (!articleElement) {
           return { success: false, images: [] };
